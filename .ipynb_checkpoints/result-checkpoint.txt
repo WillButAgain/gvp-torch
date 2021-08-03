@@ -1,0 +1,528 @@
+Wrote profile results to train.py.lprof
+Timer unit: 1e-06 s
+
+Total time: 25.8418 s
+File: train.py
+Function: run at line 16
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    16                                           @profile
+    17                                           def run():
+    18         1         12.0     12.0      0.0      AA_identities = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', 'O', 'U', 'B', 'Z', 'X', 'J']
+    19         1         15.0     15.0      0.0      AA_identity_vocab = {word:ind+1 for ind, word in enumerate(AA_identities)} 
+    20         1          9.0      9.0      0.0      AA_identity_vocab['pad'] = 0
+    21                                           
+    22         1          9.0      9.0      0.0      def _get_atom_coord_tensor(chain, device='cpu'):
+    23                                                   # residue atoms are C-1, N, CA, C, N+1, CA+1
+    24                                                   # ret is (n_residues, (C-1, N, CA, C, N+1, CA+1), (x, y, z)) / shape (n_residues, 5, 3)
+    25                                                   residue_coords = []
+    26                                                   numResidues = chain.numResidues()
+    27                                                   for i, residue in enumerate(chain.iterResidues()):
+    28                                                       # handle start of sequence
+    29                                                       if not i:
+    30                                                           residue_coords.append([
+    31                                                               3*[np.nan],
+    32                                                               residue['N']._getCoords(),
+    33                                                               residue['CA']._getCoords(),
+    34                                                               residue['C']._getCoords(), 
+    35                                                               residue.getNext()['N']._getCoords(),
+    36                                                               residue.getNext()['CA']._getCoords(),
+    37                                                               3*[np.nan],
+    38                                                           ])
+    39                                                           continue
+    40                                                       # handle end of sequence
+    41                                                       if i+1==numResidues:
+    42                                                           residue_coords.append([
+    43                                                               residue.getPrev()['C']._getCoords(), 
+    44                                                               residue['N']._getCoords(),
+    45                                                               residue['CA']._getCoords(), 
+    46                                                               residue['C']._getCoords(),
+    47                                                               3*[np.nan],
+    48                                                               3*[np.nan],
+    49                                                               residue.getPrev()['CA']._getCoords(),
+    50                                                           ])
+    51                                                           break
+    52                                           
+    53                                                       residue_coords.append([
+    54                                                           residue.getPrev()['C']._getCoords(), 
+    55                                                           residue['N']._getCoords(), 
+    56                                                           residue['CA']._getCoords(), 
+    57                                                           residue['C']._getCoords(), 
+    58                                                           residue.getNext()['N']._getCoords(),
+    59                                                           residue.getNext()['CA']._getCoords(),
+    60                                                           residue.getPrev()['CA']._getCoords(),
+    61                                                       ])
+    62                                                   return torch.tensor(residue_coords, device=device)
+    63                                           
+    64         1          8.0      8.0      0.0      def get_dihedral(c1, c2, c3, c4):    
+    65                                                   """ Returns the dihedral angle in radians.
+    66                                                       Will use atan2 formula from: 
+    67                                                       https://en.wikipedia.org/wiki/Dihedral_angle#In_polymer_physics
+    68                                                       Inputs: 
+    69                                                       * c1: (batch, 3) or (3,)
+    70                                                       * c2: (batch, 3) or (3,)
+    71                                                       * c3: (batch, 3) or (3,)
+    72                                                       * c4: (batch, 3) or (3,)
+    73                                                   """
+    74                                                   u1 = c2 - c1
+    75                                                   u2 = c3 - c2
+    76                                                   u3 = c4 - c3
+    77                                           
+    78                                                   return torch.atan2( ( (torch.norm(u2, dim=-1, keepdim=True) * u1) * torch.cross(u2,u3, dim=-1) ).sum(dim=-1) ,  
+    79                                                                       (  torch.cross(u1, u2, dim=-1) * torch.cross(u2, u3, dim=-1) ).sum(dim=-1) )
+    80                                           
+    81         1          9.0      9.0      0.0      def get_dihedral_tensor(atom_coord_tensor):
+    82                                                   # get Psi dihedrals - N, CA, C, N+1
+    83                                                   psi_dihedrals = get_dihedral(*torch.unbind(atom_coord_tensor[: , 1:5], dim=1))*57.2958
+    84                                                   # get Phi dihedrals - C-1, N, CA, C
+    85                                                   phi_dihedrals = get_dihedral(*torch.unbind(atom_coord_tensor[: , :-3], dim=1))*57.2958
+    86                                                   # get Phi dihedrals - CA, C, N+1, CA+1
+    87                                                   omega_dihedrals = get_dihedral(*torch.unbind(atom_coord_tensor[: , 1:-2], dim=1))*57.2958
+    88                                           
+    89                                                   psi_phi_omega = torch.stack([psi_dihedrals, phi_dihedrals, omega_dihedrals]).T.to(atom_coord_tensor.device)
+    90                                           
+    91                                                   # make this return sin(angles), cos(angles) for ret.shape=(n_residues, 6) instead of (n_residues, 3)
+    92                                                   return torch.cat([torch.sin(psi_phi_omega), torch.cos(psi_phi_omega)], dim=-1)
+    93                                           
+    94         1          9.0      9.0      0.0      def _rbf(D, D_min=0., D_max=20., D_count=16):
+    95                                                   '''
+    96                                                   From https://github.com/jingraham/neurips19-graph-protein-design
+    97                                           
+    98                                                   Returns an RBF embedding of `torch.Tensor` `D` along a new axis=-1.
+    99                                                   That is, if `D` has shape [...dims], then the returned tensor will have
+   100                                                   shape [...dims, D_count].
+   101                                                   '''
+   102                                                   D_mu = torch.linspace(D_min, D_max, D_count, device=D.device)
+   103                                                   D_mu = D_mu.view([1, -1])
+   104                                                   D_sigma = (D_max - D_min) / D_count
+   105                                                   D_expand = torch.unsqueeze(D, -1)
+   106                                           
+   107                                                   RBF = torch.exp(-((D_expand - D_mu) / D_sigma) ** 2)
+   108                                                   return RBF
+   109                                           
+   110                                           
+   111         1          9.0      9.0      0.0      def get_knn_indices(distances, k=30):
+   112                                                   topk = torch.topk(distances, k=k, dim=1, largest=False)
+   113                                                   node_indices = torch.repeat_interleave(torch.arange(0, topk.indices.size(-2), device=distances.device), topk.indices.size(-1)).unsqueeze(-2)
+   114                                                   per_node_indices = topk.indices.view(1, -1)
+   115                                                   return  torch.cat([node_indices, per_node_indices], dim=-2)
+   116                                           
+   117         1          9.0      9.0      0.0      def compute_AA_orientation(atom_coord_tensor):
+   118                                                   # see third bullet point in the discussion of node features here-
+   119                                                   # https://arxiv.org/pdf/2009.01411.pdf (GVP paper)
+   120                                                   n = atom_coord_tensor[:, 1] - atom_coord_tensor[:, 2] # N-CA
+   121                                                   c = atom_coord_tensor[:, 3] - atom_coord_tensor[:, 2]
+   122                                           
+   123                                                   nxc = torch.cross(n, c, dim=-1)
+   124                                                   nxc *= 0.577/torch.norm(nxc, dim=-1, keepdim=True) # coef is sqrt(1/3)
+   125                                           
+   126                                                   second_term = ((n+c)*0.816)/torch.norm(n+c, dim=-1, keepdim=True) # coef is sqrt(2/3)
+   127                                           
+   128                                                   return nxc - second_term
+   129                                           
+   130         1          9.0      9.0      0.0      def _positional_embeddings(edge_index, num_embeddings=None, period_range=[2, 1000], device='cpu'):
+   131                                                   # From https://github.com/jingraham/neurips19-graph-protein-design
+   132                                                   d = edge_index[0] - edge_index[1]
+   133                                           
+   134                                                   frequency = torch.exp(
+   135                                                       torch.arange(0, num_embeddings, 2, dtype=torch.float32, device=device)
+   136                                                       * -(np.log(10000.0) / num_embeddings)
+   137                                                   )
+   138                                                   angles = d.unsqueeze(-1) * frequency
+   139                                                   E = torch.cat((torch.cos(angles), torch.sin(angles)), -1)
+   140                                                   return E
+   141                                           
+   142         1          9.0      9.0      0.0      def embed_sequence(chain, vocab, device):
+   143                                                   return torch.Tensor([vocab[residue.getSequence()[0]] for residue in chain.iterResidues()]).to(device)
+   144                                           
+   145         1          8.0      8.0      0.0      def get_distances(atom_coord_tensor):
+   146                                                   # euchlidean distance, diagonal will have large value since that is usually important 
+   147                                                   almost_distances = atom_coord_tensor[:, 2].unsqueeze(0) - atom_coord_tensor[:, 2].unsqueeze(1) # distance between alpha carbons CA
+   148                                                   distances = torch.sqrt((almost_distances**2).sum(-1))
+   149                                                   distances += distances.max()*torch.eye(distances.size(0), device=atom_coord_tensor.device)
+   150                                                   return distances
+   151                                           
+   152                                           
+   153         1          9.0      9.0      0.0      def parse_pdb(pdb_path, device='cpu', inject_noise=False):
+   154                                                   chain = pr.parsePDB(pdb_path, chain='A', model=1)
+   155                                                   # dim is (n_residues, 7, 3)
+   156                                                   atom_coord_tensor = _get_atom_coord_tensor(chain, device)[1:-1].float() # residue atoms are C-1, N, CA, C, N+1, CA+1, CA-1
+   157                                                   if inject_noise: # this is used for de-noising training
+   158                                                       atom_coord_tensor += (atom_coord_tensor.max() - atom_coord_tensor.min()) * torch.rand_like(atom_coord_tensor) / 3
+   159                                                   # == construct node feature set ==
+   160                                                   # get dihedral angles (TODO - raise these to the circle, currently just psi, phi, omega)
+   161                                                   dihedrals = get_dihedral_tensor(atom_coord_tensor)
+   162                                           
+   163                                                   # get idx of AA based on vocab 
+   164                                                   idx_tensor = embed_sequence(chain, vocab=AA_identity_vocab, device=device)[1:-1]
+   165                                           
+   166                                                   # forward and backward unit vectors in the direction of CA -> CA+1, and CA -> CA-1 respectively 
+   167                                                   forward = atom_coord_tensor[:, -2] - atom_coord_tensor[:, 2]
+   168                                                   backward = atom_coord_tensor[:, 2] - atom_coord_tensor[:, -1]
+   169                                                   forward /= torch.norm(forward, dim=-1, keepdim=True)
+   170                                                   backward /= torch.norm(backward, dim=-1, keepdim=True)
+   171                                           
+   172                                                   AA_orientation_vec = compute_AA_orientation(atom_coord_tensor)
+   173                                                   # dihedrals - first 6 elemeents - scalar features
+   174                                                   # AA_identity_embeddings - subsequent 16 elemeents - scalar features
+   175                                                   # forward/backward - subsequent 6 elements, vector features
+   176                                                   # AA_orientation_vec - subsequent 3 elements, vector features
+   177                                                   node_feats = torch.cat([idx_tensor.unsqueeze(-1), dihedrals, forward, backward, AA_orientation_vec], dim=-1)
+   178                                           
+   179                                                   # == construct edge feature set ==
+   180                                                   distances = get_distances(atom_coord_tensor)
+   181                                                   # neighbors are defined by the nearest k=30 nodes
+   182                                                   edge_idx = get_knn_indices(distances, k=30)
+   183                                                   rbf_distances = _rbf(distances[edge_idx[0], edge_idx[1]], D_min=distances.min(), D_max=distances.max())
+   184                                           
+   185                                                   # get unit vectors in the direction of a parent node alpha carbon to a child node alpha carbon Cai -> Caj
+   186                                                   directional_vectors = atom_coord_tensor[edge_idx[0], 3] - atom_coord_tensor[edge_idx[1], 3] # recall: idx=3 is alpha carbons
+   187                                                   directional_vectors /= torch.norm(directional_vectors, dim=-1, keepdim=True)
+   188                                           
+   189                                                   pos_embedding = _positional_embeddings(edge_idx, num_embeddings=4, device=device)
+   190                                                   # rbf_distances - first 16 elemeents - scalar features
+   191                                                   # pos_embedding, subsequent "num_embeddings" elements, scalar features
+   192                                                   # directional_vectors - subsequent 3 elemeents - vector features
+   193                                                   edge_feats = torch.cat([rbf_distances, pos_embedding, directional_vectors], dim=-1)
+   194                                           
+   195                                                   return node_feats.float(), edge_feats.float(), edge_idx, atom_coord_tensor
+   196                                           
+   197                                           
+   198         1          8.0      8.0      0.0      def exists(thing): return thing is not None
+   199                                           
+   200                                               # get/post because that is the terminology for get/opposite of get in an API
+   201                                               # it made sense at the time of writing
+   202                                               # EDIT 3 days later - it does not make sense and is stupid but too lazy to change
+   203         1          9.0      9.0      0.0      def get_scalar_vec_feats(node_feats, n_vecs=2):
+   204                                                   return node_feats[..., :-3*n_vecs], node_feats[..., -3*n_vecs:].view(-1, n_vecs, 3)
+   205         1          8.0      8.0      0.0      def post_scalar_vec_feats(s, v, n_vecs=2):
+   206                                                   return torch.cat([s, v.view(-1, n_vecs*3)], -1)
+   207                                           
+   208                                               # there is probably a better way to do this using torch.gather() or something, but this is guaranteed to execute well on cuda
+   209         1         26.0     26.0      0.0      class MessagePassing(torch.nn.Module):  
+   210                                                   def __init__(self):
+   211                                                       super().__init__()    
+   212                                           
+   213                                                   def _sum_over_neighbors(self, edge_attrs, attr_idx):
+   214                                                       '''
+   215                                                       inputs - edge_attrs, attr_idx
+   216                                                       edge_attrs is the edge attributes, shape is (number of edges, number of edge features)
+   217                                                       attr_idx is the edge information, first column is parent node, second column is child node, shape is (number of edges, number of edge features)
+   218                                           
+   219                                                       order is kept specific in both tensors - they should map 1:1 edge identification in attr_idx and edge features in edge_attrs
+   220                                                       '''
+   221                                                       n_edge_feats = edge_attrs.size(-1)
+   222                                                       n_edges = edge_attrs.size(0)
+   223                                           
+   224                                                       # edge attributes in form that floats the boat of torch.sparse_coo_tensor
+   225                                                       flat_edges = edge_attrs.contiguous().view(-1, 1)
+   226                                           
+   227                                                       # shape of these idx tensors will be n_edge_feats*n_edges or attr_idx.size(0)*attr_idx.size(1)
+   228                                                       attr_idx = attr_idx.long().repeat(1, n_edge_feats) # repeat tensor of edge idx to expand computation to each feature
+   229                                                       attr_idx2 = torch.arange(0, n_edge_feats, dtype=torch.long, device=edge_attrs.device).repeat_interleave(n_edges).unsqueeze(0) 
+   230                                                       indices = torch.cat([attr_idx, attr_idx2], dim=0)
+   231                                           
+   232                                                       adjacency_attrs = torch.sparse_coo_tensor(indices, flat_edges.squeeze(), (indices.max()+1, indices.max()+1, n_edge_feats))
+   233                                           
+   234                                                       # analog of adjacency matrix, except each entry is edge information
+   235                                                       # aggregate across n_nodes dimension to aggregate across neighbors
+   236                                                       # ret.shape = (n_nodes, edge_attr_dim)
+   237                                                       return torch.sparse.sum(adjacency_attrs, -2).to_dense()
+   238                                           
+   239         1          9.0      9.0      0.0      def GVP_layernorm(V):
+   240                                                   # V.shape = (n_nodes, v, 3)
+   241                                                   # scale the row vectors of V such that their root-mean-square norm is one
+   242                                                   assert torch.norm(V, keepdim=True)/V.size(-2) > 0, 'GVP layernorm encountered negative value or zero in denominator'
+   243                                                   return V/torch.sqrt(torch.norm(V, keepdim=True)/V.size(-2)) #.size(-2) is v    
+   244                                           
+   245         1         19.0     19.0      0.0      class Layernorm_combined(torch.nn.Module):
+   246                                                   def __init__(self):
+   247                                                       super().__init__(x_out_scalar_channels)
+   248                                                       self.layernorm = nn.LayerNorm(x_out_scalar_channels)
+   249                                           
+   250                                                   def forward(self, s, V):
+   251                                                       assert s.max() < 1e21, 'your values being passed to layernorm are too large, they will return nan'
+   252                                                       return self.layernorm(s), GVP_layernorm(V)
+   253                                           
+   254                                           
+   255         1         22.0     22.0      0.0      class GVP(nn.Module):
+   256                                                   '''    
+   257                                                   Bowen Jing et. al. (2021)
+   258                                                   Learning from Protein Structure with Geometric Vector Perceptrons
+   259                                                   https://arxiv.org/pdf/2009.01411.pdf
+   260                                                   '''
+   261                                                   def __init__(self, v_dim, μ_dim, n_dim, m_dim, h_dim):
+   262                                                       super().__init__()
+   263                                                       self.v_dim = v_dim
+   264                                                       self.μ_dim = μ_dim
+   265                                                       self.n_dim = n_dim
+   266                                                       self.m_dim = m_dim
+   267                                                       self.h_dim = h_dim
+   268                                           
+   269                                                       # usually, node_feats_dim == h_dim, for all but first layer 
+   270                                                       if not exists(h_dim):
+   271                                                           h_dim = v_dim
+   272                                           
+   273                                                       # for vector transformations
+   274                                                       self.Wh = nn.Parameter(torch.normal(mean=0, std=0.25, size=(h_dim, v_dim)))
+   275                                                       self.Wμ = nn.Parameter(torch.normal(mean=0, std=0.25, size=(μ_dim, h_dim)))
+   276                                           
+   277                                                       # for scalar transformations
+   278                                                       self.Wm = nn.Sequential(
+   279                                                           nn.Linear(h_dim+n_dim, m_dim),
+   280                                                           nn.ReLU(),
+   281                                                       )
+   282                                           
+   283                                                       self.σplus = nn.ReLU()
+   284                                           
+   285                                                   def forward(self, x, split_output=False):
+   286                                                       s, V = get_scalar_vec_feats(x, n_vecs = self.v_dim)
+   287                                                       Vh = self.Wh @ V
+   288                                                       Vμ = self.Wμ @ Vh
+   289                                           
+   290                                                       sh = torch.norm(Vh, dim=-1) # V=vector, this is norm along euchlidean vector channel (x,y,z) -> L
+   291                                                       vμ = torch.norm(Vμ, dim=-1, keepdim=True)
+   292                                           
+   293                                                       shn = torch.cat([s, sh], dim=-1)
+   294                                           
+   295                                                       s_ = self.Wm(shn)
+   296                                           
+   297                                                       V_ = self.σplus(vμ) * Vμ
+   298                                           
+   299                                                       if split_output:
+   300                                                           return s_, V_
+   301                                           
+   302                                                       return post_scalar_vec_feats(s_, V_, n_vecs = self.μ_dim)
+   303                                           
+   304                                           
+   305         1         23.0     23.0      0.0      class GVP_MPNN(MessagePassing):
+   306                                                   '''    
+   307                                                   Message passing layer as defined in the GVP paper;
+   308                                           
+   309                                                   Bowen Jing et. al. (2021)
+   310                                                   Learning from Protein Structure with Geometric Vector Perceptrons
+   311                                                   https://arxiv.org/pdf/2009.01411.pdf
+   312                                                   '''
+   313                                                   def __init__(
+   314                                                           self, # no, there is not a better way to do this, probably
+   315                                                           x_out_vector_channels,
+   316                                                           x_out_scalar_channels,
+   317                                                           edge_out_vector_channels,
+   318                                                           edge_out_scalar_channels,
+   319                                                           hidden_dim, 
+   320                                                           dropout_p=0.1,
+   321                                                           residual=True):
+   322                                                       super().__init__()
+   323                                           
+   324                                                       self.ve_dim = edge_out_vector_channels
+   325                                                       self.μe_dim = edge_out_vector_channels
+   326                                                       ne_dim = edge_out_scalar_channels
+   327                                                       me_dim = edge_out_scalar_channels
+   328                                                       vx_dim = x_out_vector_channels
+   329                                                       self.μx_dim = x_out_vector_channels
+   330                                                       nx_dim = x_out_scalar_channels
+   331                                                       mx_dim = x_out_scalar_channels
+   332                                                       h_dim = hidden_dim
+   333                                                       self.residual = residual
+   334                                           
+   335                                                       self.g_v = GVP(v_dim=vx_dim, n_dim=nx_dim, μ_dim=self.μx_dim, h_dim=h_dim, m_dim=mx_dim) # for nodes
+   336                                                       self.g_ve = GVP(v_dim=self.μx_dim+self.ve_dim, n_dim=mx_dim+ne_dim, μ_dim=self.μx_dim, h_dim=h_dim, m_dim=mx_dim) # for nodes and edges
+   337                                                       self.g_e = GVP(v_dim=self.μx_dim+self.ve_dim, n_dim=mx_dim+ne_dim, μ_dim=self.μe_dim, h_dim=h_dim, m_dim=me_dim) # for nodes and edges
+   338                                           
+   339                                                       self.ln = nn.LayerNorm(48)
+   340                                                       self.d = nn.Dropout(dropout_p)
+   341                                                       self.d2 = nn.Dropout2d(dropout_p)
+   342                                           
+   343                                                   def norm_and_dropout(self, s, V): # you can only combine them when your model is NOT residual
+   344                                                       return self.ln(self.d(s)), GVP_layernorm(self.d2(V))
+   345                                           
+   346                                                   def forward(self, node_attrs, edge_attrs, edge_idx):
+   347                                           
+   348                                                       # == equation 5 in the paper, except not residual ==
+   349                                                       # perform the node update first - project node features to hidden dimension 
+   350                                                       s_node, V_node = self.g_v(node_attrs, split_output=True)
+   351                                           
+   352                                                       if self.residual:
+   353                                                           s_node_before, V_node_before = get_scalar_vec_feats(node_attrs, n_vecs=self.g_v.μ_dim)
+   354                                                           s_node += s_node_before
+   355                                                           V_node += V_node_before
+   356                                                       s_node, V_node = self.norm_and_dropout(s_node, V_node)
+   357                                                       node_attrs = post_scalar_vec_feats(s_node, V_node, n_vecs = self.g_v.μ_dim)
+   358                                           
+   359                                                       # == equation 3 in the paper ===
+   360                                                       # get scalar and vector features for all edges
+   361                                                       s_node, V_node = get_scalar_vec_feats(node_attrs[edge_idx[1]], n_vecs=self.g_v.μ_dim) # edge_idx[1] refers to the SOURCE nodes
+   362                                                       s_edge, V_edge = get_scalar_vec_feats(edge_attrs, n_vecs=self.ve_dim) # 1 comes from data preprocessing
+   363                                           
+   364                                                       # concatenate - information required for edge update is all edge and all node scalar+vector features
+   365                                                       s = torch.cat([s_node, s_edge], dim=-1)
+   366                                                       V = torch.cat([V_node, V_edge], dim=-2)
+   367                                                       attr_and_edge_tensor = post_scalar_vec_feats(s, V, n_vecs=self.μx_dim+self.μe_dim)
+   368                                           
+   369                                                       # get updated edge representation
+   370                                                       hij = self.g_ve(attr_and_edge_tensor)
+   371                                           
+   372                                                       # == equation 4 in the paper ==
+   373                                                       node_update = self._sum_over_neighbors(hij, edge_idx) / 30 # 30 here is because we manually enforce 30 edges per node
+   374                                           
+   375                                                       s_node, V_node = get_scalar_vec_feats(node_update, n_vecs=self.g_ve.μ_dim)
+   376                                                       if self.residual:
+   377                                                           s_node_before, V_node_before = get_scalar_vec_feats(node_attrs, n_vecs=self.g_v.μ_dim)
+   378                                                           s_node += s_node_before
+   379                                                           V_node += V_node_before
+   380                                                       s_node, V_node = self.norm_and_dropout(s_node, V_node)
+   381                                                       node_update = post_scalar_vec_feats(s_node, V_node, n_vecs=self.g_ve.μ_dim)
+   382                                           
+   383                                                       # == not done in paper ==
+   384                                                       # to aggregate and add the messages to the nodes, they need to be the same shape, and thus the edge/node information
+   385                                                       # ends up being the same shape. here, we pass the edges through another GVP sequence to get them into different shapes
+   386                                                       hij = self.g_e(attr_and_edge_tensor)
+   387                                           
+   388                                                       return node_attrs + node_update, hij 
+   389                                           
+   390         1         22.0     22.0      0.0      class GVP_GNN(MessagePassing):
+   391                                                   '''    
+   392                                                   Message passing layer as defined in the GVP paper;
+   393                                           
+   394                                                   Bowen Jing et. al. (2021)
+   395                                                   Learning from Protein Structure with Geometric Vector Perceptrons
+   396                                                   https://arxiv.org/pdf/2009.01411.pdf
+   397                                                   '''
+   398                                                   def __init__(
+   399                                                           self, # no, there is not a better way to do this, probably
+   400                                                           x_out_vector_channels,
+   401                                                           x_out_scalar_channels,
+   402                                                           edge_out_vector_channels,
+   403                                                           edge_out_scalar_channels,
+   404                                                           hidden_dim, 
+   405                                                           edge_in_scalar_channels=22,
+   406                                                           edge_in_vector_channels=1,
+   407                                                           x_in_vector_channels=3,
+   408                                                           x_in_scalar_channels=22,
+   409                                                           dropout_p=0.1,
+   410                                                           n_layers=3,
+   411                                                       ):
+   412                                                       super().__init__()
+   413                                                       self.gcnn_layers = torch.nn.ModuleList()
+   414                                           
+   415                                                       # == these layers will be used to project nodes/edges to the dimensions usable by the MPNN layers ==
+   416                                                       self.g_v = GVP( # for nodes
+   417                                                           v_dim=x_in_vector_channels, 
+   418                                                           n_dim=x_in_scalar_channels,
+   419                                                           μ_dim=x_out_vector_channels,
+   420                                                           m_dim=x_out_scalar_channels,
+   421                                                           h_dim=hidden_dim,
+   422                                                       )
+   423                                                       self.g_ve = GVP( # for nodes and edges
+   424                                                           v_dim=edge_in_vector_channels,
+   425                                                           n_dim=edge_in_scalar_channels, 
+   426                                                           μ_dim=edge_out_vector_channels,
+   427                                                           h_dim=hidden_dim,
+   428                                                           m_dim=edge_out_scalar_channels
+   429                                                       )
+   430                                           
+   431                                                       self.layernorm = nn.LayerNorm(x_out_scalar_channels)
+   432                                                       self.d = nn.Dropout(dropout_p)
+   433                                           
+   434                                                       self.embed = torch.nn.Embedding(len(AA_identity_vocab), embedding_dim=16, padding_idx=0)
+   435                                           
+   436                                                       for _ in range(n_layers):
+   437                                                           self.gcnn_layers.append(GVP_MPNN(
+   438                                                               x_out_vector_channels=x_out_vector_channels,
+   439                                                               x_out_scalar_channels=x_out_scalar_channels,
+   440                                                               edge_out_vector_channels=edge_out_vector_channels,
+   441                                                               edge_out_scalar_channels=edge_out_scalar_channels,
+   442                                                               hidden_dim=hidden_dim,
+   443                                                           ))
+   444                                           
+   445                                                   def forward(self, node_attrs, edge_attrs, edge_idx, coords):
+   446                                                       # this just embeds amino acids with the embedding defined in __init__ :(
+   447                                                       node_attrs = self.embed_node_features(node_attrs)
+   448                                           
+   449                                                       # project node and edge attributes to the dimensions used by the rest of the model
+   450                                                       node_attrs = self.g_v(node_attrs, split_output=False)        
+   451                                                       edge_attrs = self.g_ve(edge_attrs)
+   452                                           
+   453                                                       for layer in self.gcnn_layers:
+   454                                                           node_attrs, edge_attrs = layer(node_attrs, edge_attrs, edge_idx)
+   455                                                       # TODO - maybe edges still contain information at final layer? latent = torch.cat([node_attrs.mean(-2), edge_attrs.mean(-2)], dim=-1)
+   456                                                       latent = node_attrs.mean(-2)
+   457                                                       return node_attrs, latent
+   458                                           
+   459                                                   def embed_node_features(self, node_attrs):
+   460                                                       # i accidently wrote this in such a way that it only works if idx_col = 0
+   461                                                       idx_col = 0
+   462                                                       assert (node_attrs[:, idx_col].int().float() == node_attrs[:, idx_col]).all(), f'you have probably the column which holds your amino acid identity indices at the incorrect location, idx tensor looks like this - {node_attrs[:, idx_col]}'
+   463                                                       AA_embeddings = self.embed(node_attrs[:, idx_col].long())
+   464                                                       return torch.cat([AA_embeddings, node_attrs[:, 1:]], dim=-1)
+   465                                           
+   466         1         22.0     22.0      0.0      class NoisyDataFolder(object):
+   467                                                   '''
+   468                                                   Only grabs .PDB files
+   469                                                   '''
+   470                                                   def __init__(self, data_folder, device, shuffle=False):
+   471                                                       self.data_folder = data_folder
+   472                                                       self.data_files = [fn for fn in os.listdir(data_folder)]
+   473                                                       self.shuffle = shuffle
+   474                                                       self.device = device
+   475                                           
+   476                                                   def __len__(self):
+   477                                                       return len(self.data_files)
+   478                                           
+   479                                                   def __iter__(self):
+   480                                                       if self.shuffle: random.shuffle(self.data_files) # shuffle data before epoch
+   481                                                       for fn in self.data_files:
+   482                                                           fn = os.path.join(self.data_folder, fn)
+   483                                                           if not ('.pdb' in fn.lower()): # maybe want to ignore any other files in directories, such as .README files explaining data
+   484                                                               continue
+   485                                                           yield (parse_pdb(fn, inject_noise=False, device=self.device), parse_pdb(fn, inject_noise=True, device=self.device)) # (x, target)
+   486                                           
+   487                                           
+   488         1          8.0      8.0      0.0      def train(dataloader, model, loss_fn, optimizer):
+   489                                                   subset_loss = 0
+   490                                                   log_iter = 100
+   491                                                   for batch, (x, target) in enumerate(dataloader):
+   492                                                       # Compute prediction error
+   493                                                       node_feats, edge_feats, edge_idx, coords = x
+   494                                                       pred = model(*x)
+   495                                                       # :3 for first 3 items of prediction, which we choose arbitrarily. task is to predict original coordinates given noisy ones.
+   496                                                       # -1 because the dataloader returns the coordinate tensor as the last element in the tuple
+   497                                                       loss = loss_fn(pred[0][:, :3], target[-1][:, 2, :]) # we will say that the residue coordinate is the coordiante of the alpha carbon 
+   498                                           
+   499                                                       # Backpropagation
+   500                                                       optimizer.zero_grad()
+   501                                                       loss.backward()
+   502                                                       subset_loss += loss.item()
+   503                                                       optimizer.step()
+   504                                           
+   505                                                       if (1+batch) % log_iter == 0:
+   506                                                           yield subset_loss/log_iter
+   507                                           
+   508                                           
+   509         1          8.0      8.0      0.0      device = 'cuda:0'
+   510         1          8.0      8.0      0.0      epochs = 5
+   511                                           
+   512         1       2285.0   2285.0      0.0      loader = NoisyDataFolder("/data/home/will/drugs-vae/data/big_files/PDB_dump", device, shuffle=True)
+   513                                           
+   514         3    2339768.0 779922.7      9.1      model = GVP_GNN(
+   515         1          9.0      9.0      0.0          x_in_vector_channels=3,
+   516         1          8.0      8.0      0.0          x_out_vector_channels=4,
+   517         1          9.0      9.0      0.0          x_in_scalar_channels=22,
+   518         1          8.0      8.0      0.0          x_out_scalar_channels=48,
+   519         1          8.0      8.0      0.0          edge_in_vector_channels=1,
+   520         1          9.0      9.0      0.0          edge_out_vector_channels=2,
+   521         1          9.0      9.0      0.0          edge_in_scalar_channels=20,
+   522         1          8.0      8.0      0.0          edge_out_scalar_channels=16,
+   523         1          8.0      8.0      0.0          hidden_dim=16,
+   524         1          8.0      8.0      0.0          n_layers=3
+   525         1         11.0     11.0      0.0      ).to(device)
+   526                                           
+   527         1        100.0    100.0      0.0      loss = torch.nn.MSELoss()
+   528         1        728.0    728.0      0.0      optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+   529                                           
+   530         1         12.0     12.0      0.0      for epoch in range(epochs):
+   531         1       2081.0   2081.0      0.0          iterator = tqdm(train(loader, model, loss, optimizer))
+   532         1   23496379.0 23496379.0     90.9          for loss in iterator:
+   533                                                       iterator.set_description(f'Loss: {loss}')
+

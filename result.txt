@@ -1,0 +1,54 @@
+Wrote profile results to train.py.lprof
+Timer unit: 1e-06 s
+
+Total time: 35.7938 s
+File: train.py
+Function: parse_pdb at line 150
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   150                                           @profile
+   151                                           def parse_pdb(pdb_path, device='cpu', inject_noise=False):
+   152        61   19042643.0 312174.5     53.2      chain = pr.parsePDB(pdb_path, chain='A', model=1)
+   153                                               # dim is (n_residues, 7, 3)
+   154        61   14352896.0 235293.4     40.1      atom_coord_tensor = _get_atom_coord_tensor(chain, device)[1:-1].float() # residue atoms are C-1, N, CA, C, N+1, CA+1, CA-1
+   155        60        108.0      1.8      0.0      if inject_noise: # this is used for de-noising training
+   156        30       3359.0    112.0      0.0          atom_coord_tensor += (atom_coord_tensor.max() - atom_coord_tensor.min()) * torch.rand_like(atom_coord_tensor) / 3
+   157                                               # == construct node feature set ==
+   158                                               # get dihedral angles (TODO - raise these to the circle, currently just psi, phi, omega)
+   159        60      39223.0    653.7      0.1      dihedrals = get_dihedral_tensor(atom_coord_tensor)
+   160                                           
+   161                                               # get idx of AA based on vocab 
+   162        60    2277017.0  37950.3      6.4      idx_tensor = embed_sequence(chain, vocab=AA_identity_vocab, device=device)[1:-1]
+   163                                           
+   164                                               # forward and backward unit vectors in the direction of CA -> CA+1, and CA -> CA-1 respectively 
+   165        60       1834.0     30.6      0.0      forward = atom_coord_tensor[:, -2] - atom_coord_tensor[:, 2]
+   166        60        972.0     16.2      0.0      backward = atom_coord_tensor[:, 2] - atom_coord_tensor[:, -1]
+   167        60       5281.0     88.0      0.0      forward /= torch.norm(forward, dim=-1, keepdim=True)
+   168        60       2304.0     38.4      0.0      backward /= torch.norm(backward, dim=-1, keepdim=True)
+   169                                           
+   170        60      12012.0    200.2      0.0      AA_orientation_vec = compute_AA_orientation(atom_coord_tensor)
+   171                                               # dihedrals - first 6 elemeents - scalar features
+   172                                               # AA_identity_embeddings - subsequent 16 elemeents - scalar features
+   173                                               # forward/backward - subsequent 6 elements, vector features
+   174                                               # AA_orientation_vec - subsequent 3 elements, vector features
+   175        60       1601.0     26.7      0.0      node_feats = torch.cat([idx_tensor.unsqueeze(-1), dihedrals, forward, backward, AA_orientation_vec], dim=-1)
+   176                                           
+   177                                               # == construct edge feature set ==
+   178        60       9140.0    152.3      0.0      distances = get_distances(atom_coord_tensor)
+   179                                               # neighbors are defined by the nearest k=30 nodes
+   180        60      19189.0    319.8      0.1      edge_idx = get_knn_indices(distances, k=30)
+   181        60      11769.0    196.2      0.0      rbf_distances = _rbf(distances[edge_idx[0], edge_idx[1]], D_min=distances.min(), D_max=distances.max())
+   182                                           
+   183                                               # get unit vectors in the direction of a parent node alpha carbon to a child node alpha carbon Cai -> Caj
+   184        60       2896.0     48.3      0.0      directional_vectors = atom_coord_tensor[edge_idx[0], 3] - atom_coord_tensor[edge_idx[1], 3] # recall: idx=3 is alpha carbons
+   185        60       3169.0     52.8      0.0      directional_vectors /= torch.norm(directional_vectors, dim=-1, keepdim=True)
+   186                                           
+   187        60       7396.0    123.3      0.0      pos_embedding = _positional_embeddings(edge_idx, num_embeddings=4, device=device)
+   188                                               # rbf_distances - first 16 elemeents - scalar features
+   189                                               # pos_embedding, subsequent "num_embeddings" elements, scalar features
+   190                                               # directional_vectors - subsequent 3 elemeents - vector features
+   191        60        784.0     13.1      0.0      edge_feats = torch.cat([rbf_distances, pos_embedding, directional_vectors], dim=-1)
+   192                                           
+   193        60        167.0      2.8      0.0      return node_feats.float(), edge_feats.float(), edge_idx, atom_coord_tensor
+
